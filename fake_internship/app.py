@@ -6,9 +6,11 @@ import json
 import requests
 from scipy.sparse import hstack
 from PIL import Image
-import pytesseract
 from bs4 import BeautifulSoup
 import re
+import pytesseract
+
+pytesseract.pytesseract.tesseract_cmd = "/usr/bin/tesseract"
 
 # UI CONFIG
 
@@ -75,7 +77,11 @@ def clean_text(text):
     return text
 
 def extract_text_from_image(image):
-    return pytesseract.image_to_string(image, config="--psm 6")
+    try:
+        text = pytesseract.image_to_string(image, config="--psm 6")
+        return text
+    except:
+        return ""
 
 def extract_text_from_url(url):
     try:
