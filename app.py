@@ -9,6 +9,7 @@ from PIL import Image
 from bs4 import BeautifulSoup
 import re
 import pytesseract
+from urllib.parse import urlparse
 
 pytesseract.pytesseract.tesseract_cmd = "/usr/bin/tesseract"
 
@@ -86,29 +87,76 @@ def extract_text_from_image(image):
 def extract_text_from_url(url):
     try:
         headers = {"User-Agent": "Mozilla/5.0"}
-        res = requests.get(url, headers=headers, timeout=5)
+        res = requests.get(url, headers=headers, timeout=10)
+
         soup = BeautifulSoup(res.text, "html.parser")
-        return soup.get_text()
+
+        # Remove scripts/styles
+        for tag in soup(["script", "style", "noscript"]):
+            tag.extract()
+
+        text = soup.get_text(separator=" ")
+
+        # Clean excessive whitespace
+        text = re.sub(r'\s+', ' ', text).strip()
+
+        # ❗ IMPORTANT: If text too small → likely JS page
+        if len(text) < 500:
+            return "JOB_PAGE_DYNAMIC_CONTENT_NOT_LOADED"
+
+        return text
+
     except:
         return ""
 
+def get_domain(url):
+    try:
+        return urlparse(url).netloc.lower()
+    except:
+        return ""
+    
+def extract_company_name(text):
+    text = text.lower()
+
+    patterns = [
+        r'at ([a-zA-Z0-9\s]+)',
+        r'company[:\-]\s*([a-zA-Z0-9\s]+)',
+        r'([a-zA-Z0-9\s]+) is hiring',
+        r'join ([a-zA-Z0-9\s]+)'
+    ]
+
+    for pattern in patterns:
+        match = re.search(pattern, text)
+        if match:
+            name = match.group(1).strip()
+            # Avoid garbage extraction
+            if len(name.split()) <= 5:
+                return name
+
+    return None
+    
 # BLACKLIST UPDATE
 
-def update_blacklist(text, result):
+def update_blacklist(company_name, result):
     global suspicious_companies
 
-    if "FAKE" not in result and "HIGH RISK" not in result:
+    if not company_name:
         return
 
-    words = text.lower().split()
+    # Only update if STRONG FAKE
+    if "FAKE JOB DETECTED" not in result and "HIGH RISK" not in result:
+        return
 
-    for w in words:
-        if len(w) > 4 and ("intern" in w or "tech" in w):
-            if w not in suspicious_companies:
-                suspicious_companies.append(w)
+    company_name = company_name.lower().strip()
 
-    with open("blacklist.json", "w") as f:
-        json.dump(suspicious_companies, f)
+    if company_name not in suspicious_companies:
+        suspicious_companies.append(company_name)
+
+        try:
+            with open("blacklist.json", "w") as f:
+                json.dump(suspicious_companies, f, indent=4)
+        except:
+            pass
 
 # SCAM TYPE
 
@@ -132,45 +180,133 @@ def predict_job(text):
 
     cleaned = clean_text(normalize_text(text))
 
+    # TEXT VECTOR
     text_vec = vectorizer.transform([cleaned])
 
-    scam_keywords = [
-        "fee", "payment", "register", "registration", "pay",
-        "earn money", "quick money", "no experience",
-        "limited seats", "urgent hiring", "work from home",
-        "easy job", "instant joining", "training fee"
+    # FEATURES (IMPORTANT: MUST MATCH TRAINING)
+    text_length = len(cleaned)
+
+    scam_patterns = [
+        "fee", "payment", "pay", "registration",
+        "training fee", "onboarding fee",
+        "refundable", "security deposit",
+        "administrative charge", "processing fee",
+        "limited seats", "apply now",
+        "instant joining", "guaranteed placement",
+        "exclusive program"
     ]
 
-    scam_count = sum([1 for w in scam_keywords if w in cleaned])
-    is_blacklisted = any(comp in cleaned for comp in suspicious_companies)
+    scam_count = sum(1 for word in scam_patterns if word in cleaned)
 
-    extra = np.array([[len(cleaned), scam_count]])
+    # BLACKLIST CHECK
+    is_blacklisted = any(comp.lower() in cleaned for comp in suspicious_companies)
+
+    trusted_domains = [
+        "google.com",
+        "linkedin.com",
+        "indeed.com",
+        "naukri.com",
+        "zoho.com"
+    ]
+
+    # FINAL INPUT (MATCH TRAINING EXACTLY)
+    extra = np.array([[text_length, scam_count]])
     final_input = hstack((text_vec, extra))
 
+    # MODEL SCORE
     score = model.decision_function(final_input)[0]
 
-    # Decision
+    # ===============================
+    # 🔥 RISK ENGINE (IMPROVED)
+    # ===============================
+    risk_points = 0
+
+    # Base signals
+    risk_points += scam_count * 20
+
+    # Hidden fee detection (strong)
+    if any(x in cleaned for x in ["refundable", "charge", "deposit", "processing"]):
+        risk_points += 40
+
+    # Psychological tricks
+    if any(x in cleaned for x in ["limited seats", "apply now", "exclusive"]):
+        risk_points += 10
+
+    # Weak signals (controlled)
+    if "urgent" in cleaned and scam_count >= 2:
+        risk_points += 10
+
+    if "work from home" in cleaned and "no experience" in cleaned:
+        risk_points += 15
+
+    # Blacklist
+    if is_blacklisted:
+        risk_points += 50
+
+    # If domain is trusted → reduce risk
+    if any(td in cleaned for td in trusted_domains):
+        risk_points -= 10
+
+    # ===============================
+    # ✅ LEGITIMACY SIGNALS (NEW)
+    # ===============================
+    legit_score = 0
+
+    if "website" in cleaned:
+        legit_score += 10
+
+    if "years of experience" in cleaned or "founded" in cleaned:
+        legit_score += 10
+
+    if "responsibilities" in cleaned:
+        legit_score += 10
+
+    if "requirements" in cleaned:
+        legit_score += 10
+
+    if "about" in cleaned:
+        legit_score += 5
+
+    if "certificate" in cleaned and "recommendation" in cleaned:
+        legit_score += 5  # common but not strong
+
+    # Internship but structured → reduce risk
+    if "internship" in cleaned and "responsibilities" in cleaned and "requirements" in cleaned:
+        risk_points -= 10
+
+    # Reduce risk using legit score
+    risk_points -= legit_score
+
+    # ===============================
+    # COMPANY DETECTION
+    # ===============================
+    company_name = extract_company_name(text)
+
+    # ===============================
+    # 🔥 FINAL DECISION (BALANCED)
+    # ===============================
     if is_blacklisted:
         result = "🚨 HIGH RISK"
-    elif scam_count >= 3:
+
+    elif risk_points >= 60:
         result = "⚠️ FAKE JOB"
-    elif score > 0.3:
+
+    elif risk_points >= 40:
         result = "⚠️ LIKELY FAKE"
-    elif score < -0.2:
+
+    elif risk_points <= 10 and score < -0.3:
         result = "✅ GENUINE"
+
+    elif score < -0.8:
+        result = "✅ GENUINE"
+
     else:
         result = "⚠️ UNCERTAIN"
 
-    # Risk score
-    risk_score = min(100,
-        scam_count * 15 +
-        (40 if is_blacklisted else 0) +
-        (10 if "work from home" in cleaned else 0) +
-        (10 if "no experience" in cleaned else 0) +
-        (20 if "fee" in cleaned else 0)
-    )
+    # Risk score (for dashboard)
+    risk_score = max(0, min(100, risk_points))
 
-    return result, scam_count, is_blacklisted, cleaned, risk_score
+    return result, scam_count, is_blacklisted, cleaned, risk_score, company_name
 
 # ===============================
 # DASHBOARD VIEW (NEW)
@@ -208,6 +344,7 @@ def show_dashboard(risk_score, scam_count, is_blacklisted):
 # ===============================
 st.title("🕵️ Job & Internship Fraud Detector")
 st.info("⚠️ Provide text, image, or URL of the SAME job posting.")
+st.info("If you give only url, re-check it with text or screenshot to bypass dynamic content issues.")
 
 user_input = st.text_area("Paste Job Description")
 uploaded_file = st.file_uploader("Upload Screenshot", type=["png", "jpg", "jpeg"])
@@ -230,19 +367,24 @@ if st.button("🔍 Analyze"):
         combined_text += " " + extract_text_from_image(Image.open(uploaded_file))
 
     if url_input:
-        combined_text += " " + extract_text_from_url(url_input)
+        url_text = extract_text_from_url(url_input)
+
+        #if url_text == "JOB_PAGE_DYNAMIC_CONTENT_NOT_LOADED":
+            #st.warning("⚠️ This job page uses dynamic loading. Please paste job description or upload screenshot.")
+        #else:
+            #combined_text += " " + url_text
+
+        combined_text += " " + url_text
 
     if not combined_text.strip():
         st.warning("Please provide input")
     else:
 
-        result, scam_count, is_blacklisted, cleaned, risk_score = predict_job(combined_text)
+        result, scam_count, is_blacklisted, cleaned, risk_score, company_name = predict_job(combined_text)
+        update_blacklist(company_name, result)
 
-        update_blacklist(cleaned, result)
-
-        # ===============================
         # RESULT
-        # ===============================
+
         st.subheader("📊 Result")
 
         if "HIGH RISK" in result:
